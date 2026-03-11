@@ -4,6 +4,7 @@ import { closePopups, delay, findChrome, formatRut, saveScreenshot } from "../ut
 
 const BANK_URL = "https://banco.santander.cl/personas";
 type LoginContext = Page | Frame;
+type MovementAccount = { index: number; label: string; active: boolean };
 
 function parseChileanAmount(value: string): number {
   const clean = value.replace(/[^0-9-]/g, "");
@@ -447,6 +448,90 @@ async function paginateAndExtract(page: Page, debugLog: string[]): Promise<BankM
   });
 }
 
+function accountTag(label: string): string {
+  return `[${label}]`;
+}
+
+function prefixAccountToMovements(movements: BankMovement[], label: string, enabled: boolean): BankMovement[] {
+  if (!enabled) return movements;
+  const tag = accountTag(label);
+  return movements.map((movement) => {
+    if (movement.description.startsWith(tag)) return movement;
+    return { ...movement, description: `${tag} ${movement.description}`.trim() };
+  });
+}
+
+async function listMovementAccounts(page: Page): Promise<MovementAccount[]> {
+  return await page.evaluate(() => {
+    const slides = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-slide"));
+    const out: Array<{ index: number; label: string; active: boolean }> = [];
+
+    for (let i = 0; i < slides.length; i++) {
+      const slide = slides[i] as HTMLElement;
+      const text = slide.innerText?.replace(/\s+/g, " ").trim() || "";
+      if (!text) continue;
+
+      const typeMatch = text.match(/Cuenta\s+(Corriente|Vista)/i);
+      const numberMatch = text.match(/\d(?:[\s.]\d+){3,}/);
+      const type = typeMatch ? `Cuenta ${typeMatch[1]}` : "Cuenta";
+      const number = numberMatch ? numberMatch[0].replace(/\s+/g, " ").trim() : `#${i + 1}`;
+
+      out.push({
+        index: i,
+        label: `${type} ${number}`.trim(),
+        active: slide.className.includes("swiper-slide-active"),
+      });
+    }
+
+    return out;
+  });
+}
+
+async function selectMovementAccount(page: Page, index: number): Promise<boolean> {
+  const clicked = await page.evaluate((targetIndex: number) => {
+    const byAria = document.querySelector(`#tabs-carousel-movs [aria-label='Go to slide ${targetIndex + 1}']`) as HTMLElement | null;
+    if (byAria) {
+      byAria.click();
+      return true;
+    }
+
+    const dots = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-pagination-bullet"));
+    const dot = dots[targetIndex] as HTMLElement | undefined;
+    if (dot) {
+      dot.click();
+      return true;
+    }
+
+    const slides = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-slide"));
+    const slide = slides[targetIndex] as HTMLElement | undefined;
+    if (slide) {
+      const clickable =
+        (slide.querySelector(".container-account, .container-account-ccc, .container-image") as HTMLElement | null) ||
+        slide;
+      clickable.click();
+      return true;
+    }
+    return false;
+  }, index);
+
+  if (!clicked) return false;
+  await delay(1200);
+
+  const activeIndex = await page.evaluate(() => {
+    const slides = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-slide"));
+    return slides.findIndex((slide) => (slide as HTMLElement).className.includes("swiper-slide-active"));
+  });
+
+  if (activeIndex === index) return true;
+
+  await delay(1800);
+  const activeIndexRetry = await page.evaluate(() => {
+    const slides = Array.from(document.querySelectorAll("#tabs-carousel-movs .swiper-slide"));
+    return slides.findIndex((slide) => (slide as HTMLElement).className.includes("swiper-slide-active"));
+  });
+  return activeIndexRetry === index;
+}
+
 async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
   const sidebarClicked = await page.evaluate(() => {
     const byId = document.querySelector("#menu-uid-0410") as HTMLElement | null;
@@ -796,7 +881,41 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
     await delay(4000);
     await doSave(page, "04-movements");
 
-    const movements = await paginateAndExtract(page, debugLog);
+    const accounts = await listMovementAccounts(page);
+    const multiAccounts = accounts.length > 1;
+    if (accounts.length > 0) {
+      debugLog.push(`  Accounts detected: ${accounts.map((account) => account.label).join(" | ")}`);
+    } else {
+      debugLog.push("  Account carousel not detected, scraping current account only.");
+    }
+
+    let movements: BankMovement[] = [];
+    if (accounts.length <= 1) {
+      movements = await paginateAndExtract(page, debugLog);
+      if (accounts.length === 1) {
+        movements = prefixAccountToMovements(movements, accounts[0].label, multiAccounts);
+      }
+    } else {
+      for (const account of accounts) {
+        const switched = await selectMovementAccount(page, account.index);
+        if (!switched) {
+          debugLog.push(`  Could not switch to account index ${account.index} (${account.label})`);
+          continue;
+        }
+        const accountMovements = await paginateAndExtract(page, debugLog);
+        movements.push(...prefixAccountToMovements(accountMovements, account.label, multiAccounts));
+        debugLog.push(`  ${account.label}: ${accountMovements.length} movement(s)`);
+      }
+    }
+
+    const movementSeen = new Set<string>();
+    movements = movements.filter((movement) => {
+      const key = `${movement.date}|${movement.description}|${movement.amount}|${movement.balance}`;
+      if (movementSeen.has(key)) return false;
+      movementSeen.add(key);
+      return true;
+    });
+
     let balance: number | undefined;
     if (movements.length > 0) {
       const withBalance = movements.find((movement) => movement.balance > 0);
