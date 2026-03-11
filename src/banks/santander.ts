@@ -252,6 +252,8 @@ async function extractBalance(page: Page): Promise<number | undefined> {
       /saldo disponible[^\d$-]*\$\s*([\d.]+)/i,
       /saldo actual[^\d$-]*\$\s*([\d.]+)/i,
       /saldo cuenta[^\d$-]*\$\s*([\d.]+)/i,
+      /cuenta corriente[\s\S]{0,80}\$\s*([\d.]+)/i,
+      /cuenta vista[\s\S]{0,80}\$\s*([\d.]+)/i,
     ];
 
     for (const pattern of patterns) {
@@ -259,6 +261,23 @@ async function extractBalance(page: Page): Promise<number | undefined> {
       if (match && match[1]) {
         const value = parseInt(match[1].replace(/[^0-9]/g, ""), 10);
         if (!Number.isNaN(value)) return value;
+      }
+    }
+
+    const selectors = [
+      '[class*="amount"]',
+      '[class*="saldo"]',
+      "#cuentas strong",
+      "#cuentas b",
+    ];
+
+    for (const selector of selectors) {
+      const elements = Array.from(document.querySelectorAll(selector));
+      for (const element of elements) {
+        const value = (element as HTMLElement).innerText?.trim() || "";
+        if (!/^\$?\s*[\d.]+$/.test(value)) continue;
+        const amount = parseInt(value.replace(/[^0-9]/g, ""), 10);
+        if (!Number.isNaN(amount) && amount > 0) return amount;
       }
     }
 
@@ -778,7 +797,17 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
     await doSave(page, "04-movements");
 
     const movements = await paginateAndExtract(page, debugLog);
-    const balance = await extractBalance(page);
+    let balance: number | undefined;
+    if (movements.length > 0) {
+      const withBalance = movements.find((movement) => movement.balance > 0);
+      if (withBalance) {
+        balance = withBalance.balance;
+        debugLog.push(`  Balance from movements: $${balance.toLocaleString("es-CL")}`);
+      }
+    }
+    if (balance === undefined || balance === 0) {
+      balance = await extractBalance(page);
+    }
 
     debugLog.push(`8. Extracted ${movements.length} movement(s)`);
     if (balance !== undefined) {
